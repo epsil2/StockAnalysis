@@ -6,12 +6,16 @@ import pandas_ta as ta
 import plotly.graph_objs as go
 from datetime import datetime, timedelta
 
-# Database functions
+# ================== PAGE CONFIG ==================
+st.set_page_config(page_title="Stock Analyzer Pro", layout="wide")
+
+# ================== DATABASE FUNCTIONS ==================
 def save_to_db(symbol, data):
+    """Save intraday stock data to SQLite database"""
     conn = sqlite3.connect('stocks.db')
     try:
         data = data.reset_index().rename(columns={
-            'Date': 'date',
+            'Datetime': 'date',
             'Open': 'open',
             'High': 'high',
             'Low': 'low',
@@ -28,6 +32,7 @@ def save_to_db(symbol, data):
         conn.close()
 
 def load_from_db(symbol):
+    """Load intraday stock data from SQLite database"""
     conn = sqlite3.connect('stocks.db')
     try:
         df = pd.read_sql(
@@ -35,109 +40,128 @@ def load_from_db(symbol):
             conn,
             parse_dates=['date']
         )
-        df = df.set_index('date')
+        if not df.empty:
+            df = df.set_index('date').sort_index()
+            df = df[~df.index.duplicated(keep='first')]  # Remove duplicate timestamps
         return df
+    except Exception as e:
+        return pd.DataFrame()
     finally:
         conn.close()
 
-# UI Configuration
-st.set_page_config(layout="wide")
-st.title("Stock Pattern Analyzer")
+# ================== UI COMPONENTS ==================
+st.title("📈 Intraday Stock Analyzer")
 
 # Data Feed Section
-with st.expander("Data Feed Controls"):
-    col1, col2 = st.columns(2)
+with st.expander("🔌 Intraday Data Feed", expanded=True):
+    col1, col2, col3 = st.columns(3)
     with col1:
-        symbols = st.text_input("Enter Nasdaq symbols (comma-separated)", "AAPL,MSFT")
+        symbols = st.text_input("Enter symbols (e.g., NVDA,AAPL)", "NVDA")
     with col2:
-        if st.button("Feed Data"):
+        days_back = st.number_input("Days to fetch", 1, 7, 1, 
+                                   help="YFinance allows max 7 days for 1m data")
+    with col3:
+        if st.button("⏳ Feed 1-Minute Data"):
             for symbol in symbols.split(','):
                 symbol = symbol.strip()
-                data = yf.download(symbol, period="1y")
-                save_to_db(symbol, data)
-            st.success("Data loaded to database!")
-            # Add to your app.py
-st.write("Database contents sample:", load_from_db(symbols.split(',')[0].strip()).head())
+                if symbol:
+                    data = yf.download(
+                        symbol,
+                        period=f"{days_back}d",
+                        interval="1m",
+                        progress=False
+                    )
+                    save_to_db(symbol, data)
+            st.success(f"Fetched {days_back} day(s) of 1-minute data!")
 
-# Main Display Area
-col_main, col_indicators = st.columns([3, 1])
+# Main Display
+selected_symbol = st.selectbox("Select Stock", options=[s.strip() for s in symbols.split(',')])
+df = load_from_db(selected_symbol)
 
-with col_main:
-    # Stock Selection & Timeframe
-    selected_symbol = st.selectbox("Select Stock", options=symbols.split(','))
-    timeframe = st.selectbox("Timeframe", ["1d", "1h", "15m", "1m"], index=1)
+if not df.empty:
+    # Intraday Header
+    latest = df.iloc[-1]
+    prev_close = df.iloc[-2]['close'] if len(df) > 1 else latest['close']
+    price_change = latest['close'] - prev_close
+    pct_change = (price_change / prev_close) * 100
 
-    # Load Data
-    df = load_from_db(selected_symbol)
-    if not df.empty:
-        df = df.resample(timeframe).agg({
-            'open': 'first',
-            'high': 'max',
-            'low': 'min',
-            'close': 'last',
-            'volume': 'sum'
-        })
+    col1, col2, col3 = st.columns(3)
+    col1.subheader(f"{selected_symbol}")
+    col2.metric("Latest Price", f"{latest['close']:.2f} USD")
+    col3.metric("1-Min Change", f"{price_change:.2f}", f"{pct_change:.2f}%")
 
-        # Main Price Chart
-        fig = go.Figure()
-        fig.add_trace(go.Candlestick(
-            x=df.index,
-            open=df['open'],
-            high=df['high'],
-            low=df['low'],
-            close=df['close'],
-            name='Price'
-        ))
-        fig.update_layout(
-            height=600,
-            title=f"{selected_symbol} Price Chart",
-            xaxis_rangeslider_visible=False
+    # Timeframe Selection
+    timeframe_options = ["1D", "5D", "1W", "All"]
+    selected_tf = st.session_state.get("selected_tf", "1D")
+    
+    cols = st.columns(len(timeframe_options))
+    for i, tf in enumerate(timeframe_options):
+        with cols[i]:
+            if st.button(tf, key=f"tf_{tf}", 
+                        type="primary" if tf == selected_tf else "secondary"):
+                selected_tf = tf
+                st.session_state.selected_tf = tf
+
+    # Filter data based on selection
+    tf_mapping = {
+        "1D": timedelta(days=1),
+        "5D": timedelta(days=5),
+        "1W": timedelta(weeks=1),
+        "All": None
+    }
+    
+    if selected_tf != "All":
+        filtered_df = df[df.index >= (datetime.now() - tf_mapping[selected_tf])]
+    else:
+        filtered_df = df
+
+    # Intraday Chart
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=filtered_df.index,
+        open=filtered_df['open'],
+        high=filtered_df['high'],
+        low=filtered_df['low'],
+        close=filtered_df['close'],
+        name='Price'
+    ))
+    fig.update_layout(
+        height=500,
+        xaxis_rangeslider_visible=False,
+        xaxis_title="Time",
+        yaxis_title="Price (USD)",
+        margin=dict(t=30),
+        xaxis=dict(
+            type='date',
+            tickformat='%H:%M'
         )
-        st.plotly_chart(fig, use_container_width=True)
-
-with col_indicators:
-    # Technical Indicators Controls
-    st.subheader("Technical Indicators")
-    indicators = st.multiselect(
-        "Select Indicators",
-        ["RSI", "MACD", "SMA 50", "SMA 200", "Volume"],
-        default=["RSI", "MACD"]
     )
+    st.plotly_chart(fig, use_container_width=True)
 
-    # Calculate and Plot Indicators
-    if indicators:
-        indicator_fig = go.Figure()
-        
-        if "RSI" in indicators:
-            df['RSI'] = ta.rsi(df.close)
-            indicator_fig.add_trace(go.Scatter(
-                x=df.index, y=df['RSI'],
-                name='RSI', line=dict(color='purple')
-            ))
-            indicator_fig.add_hline(y=30, line_dash="dot", line_color="gray")
-            indicator_fig.add_hline(y=70, line_dash="dot", line_color="gray")
+    # Intraday Statistics
+    st.subheader("📊 Intraday Metrics")
+    
+    today = datetime.now().date()
+    today_data = df[df.index.date == today]
+    
+    if not today_data.empty:
+        vol_today = today_data['volume'].sum()
+        high_today = today_data['high'].max()
+        low_today = today_data['low'].min()
+        range_today = high_today - low_today
+    else:
+        vol_today = high_today = low_today = range_today = 0
 
-        if "MACD" in indicators:
-            macd = ta.macd(df.close)
-            df = pd.concat([df, macd], axis=1)
-            indicator_fig.add_trace(go.Scatter(
-                x=df.index, y=df['MACD_12_26_9'],
-                name='MACD', line=dict(color='blue')
-            ))
-            indicator_fig.add_trace(go.Scatter(
-                x=df.index, y=df['MACDs_12_26_9'],
-                name='Signal', line=dict(color='orange')
-            ))
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Today's High", f"{high_today:.2f}")
+    col2.metric("Today's Low", f"{low_today:.2f}")
+    col3.metric("Daily Range", f"{range_today:.2f}")
+    col4.metric("Volume Today", f"{vol_today:,}")
 
-        if "Volume" in indicators:
-            indicator_fig.add_trace(go.Bar(
-                x=df.index, y=df['volume'],
-                name='Volume', marker_color='gray'
-            ))
+else:
+    st.warning("No intraday data available. Feed data first!")
 
-        indicator_fig.update_layout(
-            height=400,
-            title="Indicators",
-            showlegend=True
-        )
-        st.plotly_chart(indicator_fig, use_container_width=True)
+# ================== RUN INSTRUCTIONS ==================
+# 1. pip install -r requirements.txt
+# 2. Create database: python -c "import sqlite3; conn = sqlite3.connect('stocks.db'); conn.close()"
+# 3. streamlit run app.py
